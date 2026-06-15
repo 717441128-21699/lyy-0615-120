@@ -1,121 +1,144 @@
 package container
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"syscall"
 )
 
 const (
-	cgroupRoot    = "/sys/fs/cgroup"
-	cgroupCPU     = "cpu"
-	cgroupMemory  = "memory"
-	cgroupCPUAcct = "cpuacct"
+	cgroupRoot = "/sys/fs/cgroup"
 )
 
-func NewCgroup(name string, cpuQuota, cpuPeriod, memory int) *Cgroup {
-	return &Cgroup{
-		Name: name,
-		CPU: CPUCgroup{
-			Quota:  cpuQuota,
-			Period: cpuPeriod,
-		},
-		Memory: MemoryCgroup{
-			Limit: memory,
-		},
+type CgroupVersion int
+
+const (
+	CgroupV1 CgroupVersion = iota
+	CgroupV2
+)
+
+type CgroupManager interface {
+	Set() error
+	AddProcess(pid int) error
+	Destroy() error
+	Version() CgroupVersion
+}
+
+type Cgroup struct {
+	Name    string
+	CPU     CPUCgroup
+	Memory  MemoryCgroup
+	manager CgroupManager
+}
+
+type CPUCgroup struct {
+	Quota  int
+	Period int
+}
+
+type MemoryCgroup struct {
+	Limit int
+}
+
+func DetectCgroupVersion() (CgroupVersion, error) {
+	f, err := os.Open("/proc/mounts")
+	if err != nil {
+		return 0, fmt.Errorf("open /proc/mounts failed: %v", err)
 	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 3 {
+			continue
+		}
+		if fields[2] == "cgroup2" {
+			return CgroupV2, nil
+		}
+	}
+
+	if _, err := os.Stat(filepath.Join(cgroupRoot, "cgroup.controllers")); err == nil {
+		return CgroupV2, nil
+	}
+
+	if _, err := os.Stat(filepath.Join(cgroupRoot, "cpu", "cgroup.procs")); err == nil {
+		return CgroupV1, nil
+	}
+
+	return 0, fmt.Errorf("cannot detect cgroup version, please ensure cgroup is mounted at %s", cgroupRoot)
+}
+
+func NewCgroup(name string, cpuQuota, cpuPeriod, memory int) (*Cgroup, error) {
+	version, err := DetectCgroupVersion()
+	if err != nil {
+		return nil, err
+	}
+
+	cg := &Cgroup{
+		Name:   name,
+		CPU:    CPUCgroup{Quota: cpuQuota, Period: cpuPeriod},
+		Memory: MemoryCgroup{Limit: memory},
+	}
+
+	switch version {
+	case CgroupV1:
+		cg.manager = newCgroupV1(cg)
+	case CgroupV2:
+		cg.manager = newCgroupV2(cg)
+	}
+
+	return cg, nil
 }
 
 func (c *Cgroup) Set() error {
-	if err := c.setupCPU(); err != nil {
-		return fmt.Errorf("setup cpu cgroup failed: %v", err)
+	if c.manager == nil {
+		return fmt.Errorf("cgroup manager not initialized")
 	}
-	if err := c.setupMemory(); err != nil {
-		return fmt.Errorf("setup memory cgroup failed: %v", err)
-	}
-	return nil
-}
-
-func (c *Cgroup) setupCPU() error {
-	cpuPath := filepath.Join(cgroupRoot, cgroupCPU, c.Name)
-	if err := os.MkdirAll(cpuPath, 0755); err != nil {
-		return fmt.Errorf("create cpu cgroup dir failed: %v", err)
-	}
-
-	if c.CPU.Period > 0 {
-		periodFile := filepath.Join(cpuPath, "cpu.cfs_period_us")
-		if err := os.WriteFile(periodFile, []byte(strconv.Itoa(c.CPU.Period)), 0644); err != nil {
-			return fmt.Errorf("write cpu.cfs_period_us failed: %v", err)
-		}
-	}
-
-	if c.CPU.Quota > 0 {
-		quotaFile := filepath.Join(cpuPath, "cpu.cfs_quota_us")
-		if err := os.WriteFile(quotaFile, []byte(strconv.Itoa(c.CPU.Quota)), 0644); err != nil {
-			return fmt.Errorf("write cpu.cfs_quota_us failed: %v", err)
-		}
-	}
-
-	return nil
-}
-
-func (c *Cgroup) setupMemory() error {
-	memPath := filepath.Join(cgroupRoot, cgroupMemory, c.Name)
-	if err := os.MkdirAll(memPath, 0755); err != nil {
-		return fmt.Errorf("create memory cgroup dir failed: %v", err)
-	}
-
-	if c.Memory.Limit > 0 {
-		limitFile := filepath.Join(memPath, "memory.limit_in_bytes")
-		if err := os.WriteFile(limitFile, []byte(strconv.Itoa(c.Memory.Limit)), 0644); err != nil {
-			return fmt.Errorf("write memory.limit_in_bytes failed: %v", err)
-		}
-	}
-
-	return nil
+	return c.manager.Set()
 }
 
 func (c *Cgroup) AddProcess(pid int) error {
-	cpuPath := filepath.Join(cgroupRoot, cgroupCPU, c.Name, "cgroup.procs")
-	if err := writeCgroupProc(cpuPath, pid); err != nil {
-		return fmt.Errorf("add process to cpu cgroup failed: %v", err)
+	if c.manager == nil {
+		return fmt.Errorf("cgroup manager not initialized")
 	}
+	return c.manager.AddProcess(pid)
+}
 
-	memPath := filepath.Join(cgroupRoot, cgroupMemory, c.Name, "cgroup.procs")
-	if err := writeCgroupProc(memPath, pid); err != nil {
-		return fmt.Errorf("add process to memory cgroup failed: %v", err)
+func (c *Cgroup) Destroy() error {
+	if c.manager == nil {
+		return nil
 	}
+	return c.manager.Destroy()
+}
 
-	return nil
+func (c *Cgroup) Version() CgroupVersion {
+	if c.manager == nil {
+		return -1
+	}
+	return c.manager.Version()
+}
+
+func writeCgroupFile(path string, content string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("mkdir %s failed: %v", filepath.Dir(path), err)
+	}
+	return os.WriteFile(path, []byte(content), 0644)
 }
 
 func writeCgroupProc(path string, pid int) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		return err
+		return fmt.Errorf("open %s failed: %v", path, err)
 	}
 	defer f.Close()
 
-	_, err = f.WriteString(strconv.Itoa(pid))
-	return err
-}
-
-func (c *Cgroup) Destroy() error {
-	var errs []error
-
-	cpuPath := filepath.Join(cgroupRoot, cgroupCPU, c.Name)
-	if err := removeCgroupDir(cpuPath); err != nil {
-		errs = append(errs, fmt.Errorf("remove cpu cgroup failed: %v", err))
-	}
-
-	memPath := filepath.Join(cgroupRoot, cgroupMemory, c.Name)
-	if err := removeCgroupDir(memPath); err != nil {
-		errs = append(errs, fmt.Errorf("remove memory cgroup failed: %v", err))
-	}
-
-	if len(errs) > 0 {
-		return fmt.Errorf("cgroup destroy errors: %v", errs)
+	if _, err := f.WriteString(strconv.Itoa(pid)); err != nil {
+		return fmt.Errorf("write pid to %s failed: %v", path, err)
 	}
 	return nil
 }
@@ -127,9 +150,23 @@ func removeCgroupDir(path string) error {
 
 	tasksFile := filepath.Join(path, "cgroup.procs")
 	tasks, err := os.ReadFile(tasksFile)
-	if err == nil && len(tasks) > 0 {
-		fmt.Fprintf(os.Stderr, "Warning: cgroup %s still has processes\n", path)
+	if err == nil && len(strings.TrimSpace(string(tasks))) > 0 {
+		fmt.Fprintf(os.Stderr, "Warning: cgroup %s still has processes, trying to kill them\n", path)
+		scanner := bufio.NewScanner(strings.NewReader(string(tasks)))
+		for scanner.Scan() {
+			pidStr := strings.TrimSpace(scanner.Text())
+			if pidStr == "" {
+				continue
+			}
+			if pid, err := strconv.Atoi(pidStr); err == nil {
+				syscallKill(pid, 9)
+			}
+		}
 	}
 
 	return os.Remove(path)
+}
+
+func syscallKill(pid int, sig int) error {
+	return syscall.Kill(pid, syscall.Signal(sig))
 }
