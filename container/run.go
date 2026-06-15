@@ -11,9 +11,9 @@ import (
 )
 
 const (
-	envRunInit     = "TINYCONTAINER_INIT"
-	envCgroupName  = "TINYCONTAINER_CGROUP_NAME"
-	envCgroupV     = "TINYCONTAINER_CGROUP_VERSION"
+	envRunInit    = "TINYCONTAINER_INIT"
+	envCgroupName = "TINYCONTAINER_CGROUP_NAME"
+	envCgroupV    = "TINYCONTAINER_CGROUP_VERSION"
 )
 
 type stageError struct {
@@ -41,42 +41,72 @@ func Run(opts *RunOptions) error {
 		return runContainerInit(opts)
 	}
 
-	var cleanupFuncs []func()
-	cleanup := func() {
-		for i := len(cleanupFuncs) - 1; i >= 0; i-- {
-			cleanupFuncs[i]()
-		}
-	}
-	defer cleanup()
-
-	if err := preflightChecks(opts); err != nil {
-		return err
-	}
-
 	cgroupName := opts.CgroupName
 	if cgroupName == "" {
 		cgroupName = "tinycontainer-" + strconv.Itoa(os.Getpid())
 	}
 
-	cgroup, err := NewCgroup(cgroupName, opts.CPUQuota, opts.CPUPeriod, opts.Memory)
-	if err != nil {
-		return stageErr("cgroup_version_detect", err)
-	}
+	var cgroupVer CgroupVersion = -1
+	var cg *Cgroup
+	var cmd *exec.Cmd
+	exitCode := 1
 
-	fmt.Fprintf(os.Stderr, "Using cgroup v%d\n", cgroup.Version()+1)
+	containerStarted := false
+	cgroupCreated := false
 
-	if err := cgroup.Set(); err != nil {
-		return stageErr("cgroup_setup", err)
-	}
-	cleanupFuncs = append(cleanupFuncs, func() {
-		if err := cgroup.Destroy(); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to destroy cgroup %s: %v\n", cgroupName, err)
-		} else {
-			fmt.Fprintf(os.Stderr, "Cgroup %s cleaned up successfully\n", cgroupName)
+	var cleanupErr error
+	var verifyErr error
+
+	defer func() {
+		if containerStarted && cmd != nil && cmd.Process != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
 		}
-	})
+	}()
 
-	cmd := exec.Command("/proc/self/exe", append([]string{"run"}, os.Args[2:]...)...)
+	if err := preflightChecks(opts); err != nil {
+		return ExitError(1, err)
+	}
+
+	var err error
+	cg, err = NewCgroup(cgroupName, opts.CPUQuota, opts.CPUPeriod, opts.Memory)
+	if err != nil {
+		return ExitError(1, stageErr("cgroup_version_detect", err))
+	}
+	cgroupVer = cg.Version()
+
+	fmt.Fprintf(os.Stderr, "Using cgroup v%d\n", cgroupVer+1)
+
+	if err := cg.Set(); err != nil {
+		return ExitError(1, stageErr("cgroup_setup", err))
+	}
+	cgroupCreated = true
+
+	defer func() {
+		if !cgroupCreated {
+			return
+		}
+
+		fmt.Fprintf(os.Stderr, "Cleaning up cgroup %s ...\n", cgroupName)
+		cleanupErr = cg.Destroy()
+		if cleanupErr != nil {
+			fmt.Fprintf(os.Stderr, "Cleanup error: %v\n", cleanupErr)
+		} else {
+			fmt.Fprintf(os.Stderr, "Cgroup %s cleanup issued\n", cgroupName)
+		}
+
+		missing := verifyCgroupCleanup(cgroupName, cgroupVer)
+		if len(missing) > 0 {
+			for _, p := range missing {
+				fmt.Fprintf(os.Stderr, "ERROR: cgroup directory still exists after cleanup: %s\n", p)
+			}
+			verifyErr = fmt.Errorf("cgroup directories still exist after cleanup: %v", missing)
+		} else {
+			fmt.Fprintf(os.Stderr, "All cgroup directories verified removed\n")
+		}
+	}()
+
+	cmd = exec.Command("/proc/self/exe", append([]string{"run"}, os.Args[2:]...)...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -91,17 +121,19 @@ func Run(opts *RunOptions) error {
 	cmd.Env = append(os.Environ(),
 		envRunInit+"=1",
 		envCgroupName+"="+cgroupName,
-		envCgroupV+"="+strconv.Itoa(int(cgroup.Version())),
+		envCgroupV+"="+strconv.Itoa(int(cgroupVer)),
 	)
 
 	if err := cmd.Start(); err != nil {
-		return stageErr("process_start", fmt.Errorf("start container process failed: %v", err))
+		return ExitError(1, stageErr("process_start", fmt.Errorf("start container process failed: %v", err)))
 	}
+	containerStarted = true
 
-	if err := cgroup.AddProcess(cmd.Process.Pid); err != nil {
+	if err := cg.AddProcess(cmd.Process.Pid); err != nil {
 		cmd.Process.Kill()
 		cmd.Wait()
-		return stageErr("cgroup_add_process", err)
+		containerStarted = false
+		return ExitError(1, stageErr("cgroup_add_process", err))
 	}
 	fmt.Fprintf(os.Stderr, "Process %d added to cgroup %s\n", cmd.Process.Pid, cgroupName)
 
@@ -112,7 +144,6 @@ func Run(opts *RunOptions) error {
 		syscall.SIGQUIT,
 		syscall.SIGHUP,
 	)
-	defer signal.Stop(sigChan)
 
 	go func() {
 		for sig := range sigChan {
@@ -122,10 +153,11 @@ func Run(opts *RunOptions) error {
 			}
 		}
 	}()
+	defer signal.Stop(sigChan)
 
-	exitCode := 0
-	if err := cmd.Wait(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+	exitCode = 0
+	if waitErr := cmd.Wait(); waitErr != nil {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
 			status := exitErr.Sys().(syscall.WaitStatus)
 			if status.Exited() {
 				exitCode = status.ExitStatus()
@@ -137,16 +169,36 @@ func Run(opts *RunOptions) error {
 			}
 		} else {
 			exitCode = 1
-			fmt.Fprintf(os.Stderr, "Container wait error: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Container wait error: %v\n", waitErr)
 		}
 	} else {
 		fmt.Fprintf(os.Stderr, "Container process exited successfully (code 0)\n")
 	}
 
-	verifyCgroupCleanup(cgroupName, cgroup.Version())
+	containerStarted = false
+	signal.Stop(sigChan)
+	close(sigChan)
 
-	os.Exit(exitCode)
-	return nil
+	// ---------- 到这里 defer 开始按逆序执行 ----------
+	// 执行顺序:
+	//   1. signal.Stop(sigChan)  ← 最后一个 defer，先执行
+	//   2. cgroup cleanup + verify ← 第二个 defer
+	//   3. kill+wait 容器进程  ← 第一个 defer（已经 containerStarted=false，跳过）
+
+	// 然后返回给调用方
+
+	finalExit := exitCode
+	if cleanupErr != nil {
+		return ExitError(1, fmt.Errorf("container exit %d but cgroup cleanup failed: %v", exitCode, cleanupErr))
+	}
+	if verifyErr != nil {
+		return ExitError(1, fmt.Errorf("container exit %d: %v", exitCode, verifyErr))
+	}
+
+	if finalExit == 0 {
+		return nil
+	}
+	return ExitError(finalExit, nil)
 }
 
 func preflightChecks(opts *RunOptions) error {
@@ -174,7 +226,7 @@ func preflightChecks(opts *RunOptions) error {
 	return nil
 }
 
-func verifyCgroupCleanup(cgroupName string, version CgroupVersion) {
+func verifyCgroupCleanup(cgroupName string, version CgroupVersion) []string {
 	var paths []string
 	switch version {
 	case CgroupV1:
@@ -188,14 +240,11 @@ func verifyCgroupCleanup(cgroupName string, version CgroupVersion) {
 		}
 	}
 
-	allClean := true
+	var stillExist []string
 	for _, p := range paths {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
-			allClean = false
-			fmt.Fprintf(os.Stderr, "ERROR: cgroup directory still exists: %s\n", p)
+			stillExist = append(stillExist, p)
 		}
 	}
-	if allClean {
-		fmt.Fprintf(os.Stderr, "All cgroup directories verified clean\n")
-	}
+	return stillExist
 }

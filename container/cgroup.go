@@ -155,5 +155,13 @@ func removeCgroupDir(path string) error {
 		}
 	}
 
-	return os.Remove(path)
+	if err := os.Remove(path); err != nil {
+		if strings.Contains(err.Error(), "directory not empty") ||
+			strings.Contains(err.Error(), "ENOTEMPTY") {
+			fmt.Fprintf(os.Stderr, "Warning: cgroup %s not empty, falling back to recursive remove\n", path)
+			return os.RemoveAll(path)
+		}
+		return err
+	}
+	return nil
 }

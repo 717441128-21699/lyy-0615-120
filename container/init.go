@@ -129,7 +129,7 @@ func runAsInit(command []string) error {
 					return fmt.Errorf("no children")
 				}
 				fmt.Fprintf(os.Stderr, "All children reaped, init process exiting with code %d\n", firstExitStatus)
-				os.Exit(firstExitStatus)
+				return ExitError(firstExitStatus, nil)
 			}
 			continue
 		}

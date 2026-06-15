@@ -18,3 +18,19 @@ type CPUCgroup struct {
 type MemoryCgroup struct {
 	Limit int
 }
+
+type ExitCodeError struct {
+	Code int
+	Err  error
+}
+
+func (e *ExitCodeError) Error() string {
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	return ""
+}
+
+func ExitError(code int, err error) *ExitCodeError {
+	return &ExitCodeError{Code: code, Err: err}
+}

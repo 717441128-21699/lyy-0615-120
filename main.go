@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -129,10 +130,21 @@ func runCmd() {
 
 	opts.Command = cmdArgs
 
-	if err := container.Run(opts); err != nil {
-		fmt.Printf("Error: %v\n", err)
-		os.Exit(1)
+	err := container.Run(opts)
+	if err == nil {
+		os.Exit(0)
 	}
+
+	var exitErr *container.ExitCodeError
+	if errors.As(err, &exitErr) {
+		if exitErr.Error() != "" {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", exitErr)
+		}
+		os.Exit(exitErr.Code)
+	}
+
+	fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	os.Exit(1)
 }
 
 func parseMemory(s string) int {
