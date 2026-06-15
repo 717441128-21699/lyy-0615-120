@@ -36,7 +36,7 @@ func stageErr(stage string, err error, a ...interface{}) error {
 	return &stageError{stage: stage, err: err}
 }
 
-func Run(opts *RunOptions) error {
+func Run(opts *RunOptions) (retErr error) {
 	if os.Getenv(envRunInit) == "1" {
 		return runContainerInit(opts)
 	}
@@ -53,14 +53,37 @@ func Run(opts *RunOptions) error {
 
 	containerStarted := false
 	cgroupCreated := false
-
-	var cleanupErr error
-	var verifyErr error
+	sigChan := make(chan os.Signal, 32)
 
 	defer func() {
+		signal.Stop(sigChan)
+		close(sigChan)
+
 		if containerStarted && cmd != nil && cmd.Process != nil {
 			cmd.Process.Kill()
 			cmd.Wait()
+		}
+
+		if cgroupCreated && cg != nil {
+			fmt.Fprintf(os.Stderr, "Cleaning up cgroup %s ...\n", cgroupName)
+
+			if err := cg.Destroy(); err != nil {
+				fmt.Fprintf(os.Stderr, "Cleanup error: %v\n", err)
+			} else {
+				fmt.Fprintf(os.Stderr, "Cgroup %s cleanup issued\n", cgroupName)
+			}
+
+			missing := verifyCgroupCleanup(cgroupName, cgroupVer)
+			if len(missing) > 0 {
+				for _, p := range missing {
+					fmt.Fprintf(os.Stderr, "ERROR: cgroup directory still exists after cleanup: %s\n", p)
+				}
+				retErr = ExitError(2, fmt.Errorf(
+					"cgroup cleanup verification failed, directories still exist: %v", missing))
+				return
+			}
+
+			fmt.Fprintf(os.Stderr, "All cgroup directories verified removed\n")
 		}
 	}()
 
@@ -74,7 +97,6 @@ func Run(opts *RunOptions) error {
 		return ExitError(1, stageErr("cgroup_version_detect", err))
 	}
 	cgroupVer = cg.Version()
-
 	fmt.Fprintf(os.Stderr, "Using cgroup v%d\n", cgroupVer+1)
 
 	if err := cg.Set(); err != nil {
@@ -82,42 +104,16 @@ func Run(opts *RunOptions) error {
 	}
 	cgroupCreated = true
 
-	defer func() {
-		if !cgroupCreated {
-			return
-		}
-
-		fmt.Fprintf(os.Stderr, "Cleaning up cgroup %s ...\n", cgroupName)
-		cleanupErr = cg.Destroy()
-		if cleanupErr != nil {
-			fmt.Fprintf(os.Stderr, "Cleanup error: %v\n", cleanupErr)
-		} else {
-			fmt.Fprintf(os.Stderr, "Cgroup %s cleanup issued\n", cgroupName)
-		}
-
-		missing := verifyCgroupCleanup(cgroupName, cgroupVer)
-		if len(missing) > 0 {
-			for _, p := range missing {
-				fmt.Fprintf(os.Stderr, "ERROR: cgroup directory still exists after cleanup: %s\n", p)
-			}
-			verifyErr = fmt.Errorf("cgroup directories still exist after cleanup: %v", missing)
-		} else {
-			fmt.Fprintf(os.Stderr, "All cgroup directories verified removed\n")
-		}
-	}()
-
 	cmd = exec.Command("/proc/self/exe", append([]string{"run"}, os.Args[2:]...)...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: syscall.CLONE_NEWPID |
 			syscall.CLONE_NEWNS |
 			syscall.CLONE_NEWNET |
 			syscall.CLONE_NEWUTS,
 	}
-
 	cmd.Env = append(os.Environ(),
 		envRunInit+"=1",
 		envCgroupName+"="+cgroupName,
@@ -130,21 +126,16 @@ func Run(opts *RunOptions) error {
 	containerStarted = true
 
 	if err := cg.AddProcess(cmd.Process.Pid); err != nil {
-		cmd.Process.Kill()
-		cmd.Wait()
-		containerStarted = false
 		return ExitError(1, stageErr("cgroup_add_process", err))
 	}
 	fmt.Fprintf(os.Stderr, "Process %d added to cgroup %s\n", cmd.Process.Pid, cgroupName)
 
-	sigChan := make(chan os.Signal, 32)
 	signal.Notify(sigChan,
 		syscall.SIGINT,
 		syscall.SIGTERM,
 		syscall.SIGQUIT,
 		syscall.SIGHUP,
 	)
-
 	go func() {
 		for sig := range sigChan {
 			if cmd.Process != nil {
@@ -153,7 +144,6 @@ func Run(opts *RunOptions) error {
 			}
 		}
 	}()
-	defer signal.Stop(sigChan)
 
 	exitCode = 0
 	if waitErr := cmd.Wait(); waitErr != nil {
@@ -176,29 +166,11 @@ func Run(opts *RunOptions) error {
 	}
 
 	containerStarted = false
-	signal.Stop(sigChan)
-	close(sigChan)
 
-	// ---------- 到这里 defer 开始按逆序执行 ----------
-	// 执行顺序:
-	//   1. signal.Stop(sigChan)  ← 最后一个 defer，先执行
-	//   2. cgroup cleanup + verify ← 第二个 defer
-	//   3. kill+wait 容器进程  ← 第一个 defer（已经 containerStarted=false，跳过）
-
-	// 然后返回给调用方
-
-	finalExit := exitCode
-	if cleanupErr != nil {
-		return ExitError(1, fmt.Errorf("container exit %d but cgroup cleanup failed: %v", exitCode, cleanupErr))
-	}
-	if verifyErr != nil {
-		return ExitError(1, fmt.Errorf("container exit %d: %v", exitCode, verifyErr))
-	}
-
-	if finalExit == 0 {
+	if exitCode == 0 {
 		return nil
 	}
-	return ExitError(finalExit, nil)
+	return ExitError(exitCode, nil)
 }
 
 func preflightChecks(opts *RunOptions) error {
