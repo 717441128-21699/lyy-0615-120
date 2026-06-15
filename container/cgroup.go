@@ -35,15 +35,6 @@ type Cgroup struct {
 	manager CgroupManager
 }
 
-type CPUCgroup struct {
-	Quota  int
-	Period int
-}
-
-type MemoryCgroup struct {
-	Limit int
-}
-
 func DetectCgroupVersion() (CgroupVersion, error) {
 	f, err := os.Open("/proc/mounts")
 	if err != nil {
@@ -159,14 +150,10 @@ func removeCgroupDir(path string) error {
 				continue
 			}
 			if pid, err := strconv.Atoi(pidStr); err == nil {
-				syscallKill(pid, 9)
+				syscall.Kill(pid, syscall.Signal(9))
 			}
 		}
 	}
 
 	return os.Remove(path)
-}
-
-func syscallKill(pid int, sig int) error {
-	return syscall.Kill(pid, syscall.Signal(sig))
 }

@@ -10,12 +10,6 @@ type RunOptions struct {
 	CgroupName string
 }
 
-type Cgroup struct {
-	Name   string
-	CPU    CPUCgroup
-	Memory MemoryCgroup
-}
-
 type CPUCgroup struct {
 	Quota  int
 	Period int

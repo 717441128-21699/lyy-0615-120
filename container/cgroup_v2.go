@@ -23,37 +23,63 @@ func (c *cgroupV2) Version() CgroupVersion {
 func (c *cgroupV2) Set() error {
 	cgPath := filepath.Join(cgroupRoot, c.cg.Name)
 
-	if err := writeCgroupFile(filepath.Join(cgPath, "cgroup.procs"), ""); err != nil {
-		return fmt.Errorf("[cgroup v2] create cgroup dir failed: %v", err)
+	cgDone := false
+
+	cleanupPartial := func() {
+		if cgDone {
+			if err := removeCgroupDir(cgPath); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: partial cleanup of %s failed: %v\n", cgPath, err)
+			}
+		}
 	}
+
+	if err := os.MkdirAll(cgPath, 0755); err != nil {
+		return fmt.Errorf("[cgroup v2] create cgroup dir %s failed: %v", cgPath, err)
+	}
+	cgDone = true
 
 	controllers, err := getAvailableControllersV2()
 	if err != nil {
-		if destroyErr := c.Destroy(); destroyErr != nil {
-			return fmt.Errorf("[cgroup v2] get available controllers failed: %v; cleanup also failed: %v", err, destroyErr)
-		}
+		cleanupPartial()
 		return fmt.Errorf("[cgroup v2] get available controllers failed: %v (cgroup cleaned up)", err)
 	}
 
-	if err := c.enableControllers(cgPath, controllers); err != nil {
-		if destroyErr := c.Destroy(); destroyErr != nil {
-			return fmt.Errorf("[cgroup v2] enable controllers failed: %v; cleanup also failed: %v", err, destroyErr)
+	cpuSupported := false
+	memSupported := false
+	for _, ctrl := range controllers {
+		if ctrl == "cpu" {
+			cpuSupported = true
 		}
+		if ctrl == "memory" {
+			memSupported = true
+		}
+	}
+
+	if err := enableControllersV2(cgPath, controllers); err != nil {
+		cleanupPartial()
 		return fmt.Errorf("[cgroup v2] enable controllers failed: %v (cgroup cleaned up)", err)
 	}
 
-	if err := c.setupCPU(cgPath); err != nil {
-		if destroyErr := c.Destroy(); destroyErr != nil {
-			return fmt.Errorf("[cgroup v2] setup cpu failed: %v; cleanup also failed: %v", err, destroyErr)
+	if c.cg.CPU.Quota > 0 || c.cg.CPU.Period > 0 {
+		if !cpuSupported {
+			cleanupPartial()
+			return fmt.Errorf("[cgroup v2] CPU controller not available on this system (cgroup cleaned up)")
 		}
-		return fmt.Errorf("[cgroup v2] setup cpu failed: %v (cgroup cleaned up)", err)
+		if err := c.setupCPUV2(cgPath); err != nil {
+			cleanupPartial()
+			return fmt.Errorf("[cgroup v2] setup CPU failed: %v (cgroup cleaned up)", err)
+		}
 	}
 
-	if err := c.setupMemory(cgPath); err != nil {
-		if destroyErr := c.Destroy(); destroyErr != nil {
-			return fmt.Errorf("[cgroup v2] setup memory failed: %v; cleanup also failed: %v", err, destroyErr)
+	if c.cg.Memory.Limit > 0 {
+		if !memSupported {
+			cleanupPartial()
+			return fmt.Errorf("[cgroup v2] Memory controller not available on this system (cgroup cleaned up)")
 		}
-		return fmt.Errorf("[cgroup v2] setup memory failed: %v (cgroup cleaned up)", err)
+		if err := c.setupMemoryV2(cgPath); err != nil {
+			cleanupPartial()
+			return fmt.Errorf("[cgroup v2] setup Memory failed: %v (cgroup cleaned up)", err)
+		}
 	}
 
 	return nil
@@ -67,7 +93,7 @@ func getAvailableControllersV2() ([]string, error) {
 	return strings.Fields(string(data)), nil
 }
 
-func (c *cgroupV2) enableControllers(cgPath string, available []string) error {
+func enableControllersV2(cgPath string, available []string) error {
 	needed := []string{"cpu", "memory"}
 	subtreeFile := filepath.Join(cgroupRoot, "cgroup.subtree_control")
 
@@ -91,42 +117,38 @@ func (c *cgroupV2) enableControllers(cgPath string, available []string) error {
 	return nil
 }
 
-func (c *cgroupV2) setupCPU(cgPath string) error {
-	if c.cg.CPU.Period <= 0 {
-		return nil
-	}
-
+func (c *cgroupV2) setupCPUV2(cgPath string) error {
 	maxFile := filepath.Join(cgPath, "cpu.max")
-	if _, err := os.Stat(maxFile); os.IsNotExist(err) {
-		return fmt.Errorf("cpu.max not supported on this system (cgroup v2 without cpu controller)")
+	if err := checkFileExists(maxFile); err != nil {
+		return fmt.Errorf("cpu.max interface file not available: %v", err)
 	}
 
 	var maxVal string
 	if c.cg.CPU.Quota <= 0 {
 		maxVal = fmt.Sprintf("max %d", c.cg.CPU.Period)
 	} else {
-		maxVal = fmt.Sprintf("%d %d", c.cg.CPU.Quota, c.cg.CPU.Period)
+		if c.cg.CPU.Period <= 0 {
+			maxVal = fmt.Sprintf("%d 100000", c.cg.CPU.Quota)
+		} else {
+			maxVal = fmt.Sprintf("%d %d", c.cg.CPU.Quota, c.cg.CPU.Period)
+		}
 	}
 
-	if err := writeCgroupFile(maxFile, maxVal); err != nil {
-		return fmt.Errorf("write cpu.max failed: %v", err)
+	if err := os.WriteFile(maxFile, []byte(maxVal), 0644); err != nil {
+		return fmt.Errorf("write cpu.max=%q failed: %v", maxVal, err)
 	}
 
 	return nil
 }
 
-func (c *cgroupV2) setupMemory(cgPath string) error {
-	if c.cg.Memory.Limit <= 0 {
-		return nil
-	}
-
+func (c *cgroupV2) setupMemoryV2(cgPath string) error {
 	maxFile := filepath.Join(cgPath, "memory.max")
-	if _, err := os.Stat(maxFile); os.IsNotExist(err) {
-		return fmt.Errorf("memory.max not supported on this system (cgroup v2 without memory controller)")
+	if err := checkFileExists(maxFile); err != nil {
+		return fmt.Errorf("memory.max interface file not available: %v", err)
 	}
 
-	if err := writeCgroupFile(maxFile, strconv.Itoa(c.cg.Memory.Limit)); err != nil {
-		return fmt.Errorf("write memory.max failed: %v", err)
+	if err := os.WriteFile(maxFile, []byte(strconv.Itoa(c.cg.Memory.Limit)), 0644); err != nil {
+		return fmt.Errorf("write memory.max=%d failed: %v", c.cg.Memory.Limit, err)
 	}
 
 	return nil
@@ -135,7 +157,7 @@ func (c *cgroupV2) setupMemory(cgPath string) error {
 func (c *cgroupV2) AddProcess(pid int) error {
 	cgPath := filepath.Join(cgroupRoot, c.cg.Name, "cgroup.procs")
 	if err := writeCgroupProc(cgPath, pid); err != nil {
-		return fmt.Errorf("[cgroup v2] add process to cgroup failed: %v", err)
+		return fmt.Errorf("[cgroup v2] add process to cgroup failed writing to %s: %v", cgPath, err)
 	}
 	return nil
 }
@@ -143,7 +165,7 @@ func (c *cgroupV2) AddProcess(pid int) error {
 func (c *cgroupV2) Destroy() error {
 	cgPath := filepath.Join(cgroupRoot, c.cg.Name)
 	if err := removeCgroupDir(cgPath); err != nil {
-		return fmt.Errorf("[cgroup v2] remove cgroup failed: %v", err)
+		return fmt.Errorf("[cgroup v2] remove cgroup dir %s failed: %v", cgPath, err)
 	}
 	return nil
 }
